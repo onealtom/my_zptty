@@ -51,8 +51,46 @@
 #include <linux/tty_driver.h>
 #include <linux/tty_flip.h>
 
+#include <linux/delay.h>
+
 #include <asm/page.h>
 #include <asm/byteorder.h>
+
+/********************************************************************************
+ * Receive Control Status Registers
+ *-------------------------------------------------------------------------------
+ *             31            24              16               8               0
+ *             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *             |F|E|D|C|B|A|9|8|7|6|5|4|3|2|1|0|F|E|D|C|B|A|9|8|7|6|5|4|3|2|1|0|
+ *             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * Addr=0x001C |                                             |O|             |R|
+ *             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * Addr=0x0028 |                                               |    RX DATA    |
+ *             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * Addr=0x002C |                          PAGE CLEAR                           |
+ *             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * Addr=0x0030 |I|                                                           | |
+ *             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *-------------------------------------------------------------------------------
+ * Status[7]   = read 1 : asserted I_LAST.
+ * Status[6:1] = reserved.
+ * Status[0]   = read 1 : when buffer no empty and Control[2]=1
+ *-------------------------------------------------------------------------------
+ * Control[7]  = write 1 : reset on.       write 0 : reset off.
+ * Control[6]  = write 1 : pause on.       write 0 : pause off.
+ * Control[5]  = write 1 : abort.          write 0 : do nothing.
+ * Control[4]  = write 1 : received data.  write 0 : do nothing.
+ * Control[3]  = reserved.
+ * Control[2]  = write 1 : if buffer no empty then set 1 to Status[0]
+ * Control[1]  = reserved.
+ * Control[0]  = reserved.
+ ********************************************************************************/
+
+#define VPKT_RX_STA_ADDR 	(0x001C)
+#define VPKT_RX_DAT_ADDR        (0x0028)
+#define VPKT_RX_CLR_ADDR        (0x002C)
+#define VPKT_INTCTL_ADDR        (0x0030)
+
 
 /********************************************************************************
  * constant
@@ -134,6 +172,8 @@ static struct device*      zptty_device_table[DEVICE_NUMS];
 #define ZPTTY_TX_STAT_ADDR      (0x001E)
 #define ZPTTY_TX_CTRL_ADDR      (0x001F)
 
+
+
 inline void zptty_tx_reset_on(struct zptty_device_data* this)
 {
 	iowrite8(0x80, this->regs_addr + ZPTTY_TX_CTRL_ADDR);
@@ -148,11 +188,12 @@ inline void zptty_tx_buf_empty_interrupt_enable(struct zptty_device_data* this)
 }
 inline unsigned int zptty_tx_get_status(struct zptty_device_data* this)
 {
-	return (unsigned int)ioread8(this->regs_addr + ZPTTY_TX_STAT_ADDR);
+	//return (unsigned int)ioread8(this->regs_addr + ZPTTY_TX_STAT_ADDR);
+	return 1;
 }
 inline void zptty_tx_clear_status_and_interrupt_disable(struct zptty_device_data* this)
 {
-	iowrite16(0x0000, this->regs_addr + ZPTTY_TX_STAT_ADDR);
+	//iowrite16(0x0000, this->regs_addr + ZPTTY_TX_STAT_ADDR);
 }
 inline void zptty_tx_transmit_start(struct zptty_device_data* this, int count, int last)
 {
@@ -218,15 +259,18 @@ inline  void zptty_rx_reset_off(struct zptty_device_data* this)
 }    
 inline  void zptty_rx_interrupt_enable(struct zptty_device_data* this)
 {
-	iowrite8((0x04), this->regs_addr + ZPTTY_RX_CTRL_ADDR);
-}    
+	iowrite32((0x80000000), this->regs_addr + VPKT_INTCTL_ADDR);
+}
 inline unsigned int zptty_rx_get_status(struct zptty_device_data* this)
 {
-	return (unsigned int)ioread8(this->regs_addr + ZPTTY_RX_STAT_ADDR);
+	return (unsigned int)ioread8(this->regs_addr + VPKT_RX_STA_ADDR);
 }
 inline void zptty_rx_clear_status_and_interrupt_disable(struct zptty_device_data* this)
 {
-	iowrite16(0x0000, this->regs_addr + ZPTTY_RX_STAT_ADDR);
+	//clear_status
+
+	//disable interrupt
+	iowrite32(0x00000000, this->regs_addr + VPKT_INTCTL_ADDR);
 }
 inline void zptty_rx_remove_from_buf(struct zptty_device_data* this, int size)
 {
@@ -292,7 +336,8 @@ static void dev_dbg_buf(struct device* dev, const char* func, unsigned char* buf
 static irqreturn_t zptty_irq(int irq, void *data)
 {
 	struct zptty_device_data* this = data;
-
+	dev_dbg(this->tty_device,"IRQ interrupt of pack dev\n");
+#if 1
 	if (this->debug & ZPTTY_DEBUG_IRQ)
 		dev_info(this->tty_device, "zptty_irq(this=%pK)\n", this);
 
@@ -313,7 +358,7 @@ static irqreturn_t zptty_irq(int irq, void *data)
 
 	if (this->debug & ZPTTY_DEBUG_IRQ)
 		dev_info(this->tty_device, "zptty_irq() => success\n");
-
+#endif
 	return IRQ_HANDLED;
 }
 
@@ -325,6 +370,14 @@ static void zptty_tty_rx_irq_work(struct work_struct* work)
 	struct zptty_device_data* this = container_of(work, struct zptty_device_data, rx_irq_work);
 	struct tty_port*          port;
 	struct tty_struct*        tty;
+	int i;
+	uint8_t des_ad[2];
+	uint8_t src_ad[2];
+	uint8_t pid;
+	uint8_t len;
+	uint8_t rx_buf[195];
+	uint8_t check[4];
+	uint8_t tmp;
 
 	if (this == NULL)
 		goto done;
@@ -345,23 +398,40 @@ static void zptty_tty_rx_irq_work(struct work_struct* work)
 		while(1) {
 			unsigned int   received_size;
 			unsigned int   buf_offset;
-
-			zptty_rx_get_buf_status(this, buf_offset, received_size);
-
-			dev_dbg(tty->dev, "%s received_size=%d\n", __func__, received_size);
-
-			if (received_size == 0)
+			
+			unsigned int rx_stat = zptty_rx_get_status(this);
+			if (rx_stat == 0) {
 				break;
+			}
+			des_ad[0] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			des_ad[1] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			src_ad[0] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			src_ad[1] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			//printk("%x %x %x %x \n", des_ad[0], des_ad[1], src_ad[0], src_ad[1] );
+			pid = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			len = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			for(i=0;i<194;i++){
+				rx_buf[i] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			}
+			//check[0] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			//check[1] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			//check[2] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			//check[3] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
+			//printk("%x %x %x %x \n", check[0],check[1],check[2],check[3] );
+			
+			/*clear page+1 */
+			tmp = (uint8_t)ioread32(this->regs_addr + VPKT_RX_CLR_ADDR);
 
-		 // dev_dbg_buf(tty->dev, __func__, (unsigned char*)(this->regs_addr+buf_offset), received_size);
+			dev_dbg(tty->dev, "%s rec_len=%d\n", __func__, len);
 
-			tty_insert_flip_string(tty_p, (char*)(this->regs_addr + buf_offset), received_size);
+		 //dev_dbg_buf(tty->dev, __func__, (unsigned char*)(this->regs_addr+buf_offset), len);
 
-			zptty_rx_remove_from_buf(this, received_size);
+			tty_insert_flip_string(tty_p, rx_buf, len);
+			//tty_insert_flip_char(tty_p, rx_buf, 195);
 
 			tty_flip_buffer_push(tty_p);
 
-			this->rx_count += received_size;
+			this->rx_count += len;
 		}
 	}
 
@@ -416,6 +486,7 @@ static int zptty_port_activate(struct tty_port* port, struct tty_struct* tty)
 	struct zptty_device_data* this = port->tty->driver_data;
 	unsigned long             irq_flags;
 	int                       retval = 0;
+	int ret;
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,20) && LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0))
 	unsigned long             irq_req_flags = IRQF_DISABLED | IRQF_SHARED;
 #else 
@@ -432,10 +503,15 @@ static int zptty_port_activate(struct tty_port* port, struct tty_struct* tty)
 	}
 	spin_unlock_irqrestore(&this->irq_lock, irq_flags);
 
-	if (request_irq(this->irq, zptty_irq, irq_req_flags, dev_name(port->tty->dev), this) != 0) {
+	ret = request_irq(this->irq, zptty_irq, IRQF_TRIGGER_RISING |\
+					IRQF_SHARED |\
+					IRQF_ONESHOT, \
+					"vvtpackdev", \
+					this);
+	if(ret !=0 ){
 		dev_err(port->tty->dev, "request_irq(%pr) failed\n", this->irq_res);
 		retval = -ENODEV;
-		goto failed;
+		goto failed;	
 	}
 
 	return 0;
@@ -587,7 +663,7 @@ static int zptty_tty_write(struct tty_struct *tty, const unsigned char* buf, int
 	unsigned char*            buf_ptr;
 
 	dev_dbg(tty->dev, "%s(tty=%pK,buf=%pK,count=%d)\n", __func__, tty, buf, count);
-	// dev_dbg_buf(tty->dev, __func__, (unsigned char*)buf, count);
+	dev_dbg_buf(tty->dev, __func__, (unsigned char*)buf, count);
 
 	if (this == NULL)
 		return -EL3HLT;
@@ -718,6 +794,37 @@ static int zptty_device_probe(struct platform_device *pdev)
 	const unsigned int        DONE_MAP_REGS_ADDR   = (1 << 4);
 	const unsigned int        DONE_GET_IRQ_RESOUCE = (1 << 4);
 
+	uint32_t tmp32;
+	uint32_t tmp32a;
+	uint32_t tmp32b;
+	uint16_t tmp16;
+	uint8_t tmp8;
+
+	//*(volatile uint8_t *)ioremap(0x40000040 ,8) = 0x00 ;
+	//*(volatile uint8_t *)ioremap(0x40000041 ,8) = 0x00 ;
+	//*(volatile uint8_t *)ioremap(0x40000042 ,8) = 0x00 ;
+	//*(volatile uint8_t *)ioremap(0x40000043 ,8) = 0x00 ;
+	//*(volatile uint8_t *)ioremap(0x40000044 ,8) = 0x00 ;
+	//*(volatile uint8_t *)ioremap(0x40000045 ,8) = 0x00 ;
+	//*(volatile uint8_t *)ioremap(0x40000046 ,8) = 0x00 ;
+	//*(volatile uint8_t *)ioremap(0x40000047 ,8) = 0x00 ;
+//
+	//printk("--------------\n");
+	//*(volatile uint32_t *)ioremap(0x40000044 ,32) = 0xFFFFFFFF ;
+//
+	//udelay(1000);
+	//*(volatile uint32_t *)ioremap(0x40000044 ,32) = 0xFFFFFFFF ;
+	//udelay(1000);
+	//printk("==============\n");
+//
+	//tmp32a=0x00000000;
+	//tmp32a = *(volatile uint32_t *)ioremap(0x40000040 ,32);
+	//tmp32b=0x00000000;
+	//tmp32b = *(volatile uint32_t *)ioremap(0x40000044 ,32);
+	//printk("0x %08X %08X\n",tmp32b, tmp32a );
+
+
+	printk("zptty_device_probe\n");
 	dev_info(&pdev->dev, "ZPTTY Driver probe start\n");
 	/*
 	 * create (zptty_device_data*)this.
@@ -813,6 +920,7 @@ static int zptty_device_probe(struct platform_device *pdev)
 			goto failed;
 		}
 		this->irq = this->irq_res->start;
+		//this->irq = 29;
 		done |= DONE_GET_IRQ_RESOUCE;
 	}
 	/*
@@ -824,8 +932,10 @@ static int zptty_device_probe(struct platform_device *pdev)
 	INIT_WORK(&this->rx_irq_work, zptty_tty_rx_irq_work);
 	INIT_WORK(&this->tx_irq_work, zptty_tty_tx_irq_work);
 	init_waitqueue_head(&this->tx_wait_queue);
-	this->tx_buf_size = (unsigned int)le16_to_cpu(ioread16(this->regs_addr + ZPTTY_TX_BUF_SIZE_ADDR));
-	this->rx_buf_size = (unsigned int)le16_to_cpu(ioread16(this->regs_addr + ZPTTY_RX_BUF_SIZE_ADDR));
+	//this->tx_buf_size = (unsigned int)le16_to_cpu(ioread16(this->regs_addr + ZPTTY_TX_BUF_SIZE_ADDR));
+	//this->rx_buf_size = (unsigned int)le16_to_cpu(ioread16(this->regs_addr + ZPTTY_RX_BUF_SIZE_ADDR));
+	this->tx_buf_size = 256;
+	this->rx_buf_size = 256;
 	/*
 	 *
 	 */
@@ -912,7 +1022,7 @@ static int __init zptty_module_init(void)
 	unsigned int       done   = 0;
 	const unsigned int DONE_TTY_DRV_REGISTER = (1 << 0);
 	const unsigned int DONE_PLT_DRV_REGISTER = (1 << 1);
-
+printk("zptty_module_init\n");
 	for (i = 0; i < DEVICE_NUMS; i++){
 		zptty_device_table[i] = NULL;
 	}

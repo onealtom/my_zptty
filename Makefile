@@ -1,9 +1,9 @@
+always	:= ./dt/lte800.dtb
+
 ARCH            := arm
 KERNEL_SRC_DIR  ?= /home/tyf/adi2/linux
-ifeq ($(shell uname -m | sed -e s/arm.*/arm/),arm)
-else
- CROSS_COMPILE  ?= arm-linux-gnueabihf-
-endif
+
+CROSS_COMPILE  ?= arm-linux-gnueabihf-
 
 obj-m := zptty.o
 
