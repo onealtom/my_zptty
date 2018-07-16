@@ -225,10 +225,12 @@ int main(int argc, char *argv[])
 	int nread;			/* Read the counts of data */
 	char buff[512];		/* Recvice data buffer */
 	pid_t pid;
-	char *xmit = "1234567890"; /* Default send data */ 
+	char *xmit = "setenv bootargs 'noinitrd console=ttyPS0,115200 ip=192.168.3.223 root=/dev/nfs rw nfsroot=192.168.3.100:/volume1/Incoming/ramdisk_FILES,nolock earlyprintk';set ipaddr 192.168.3.222;setenv serverip 192.168.3.100;tftp 0x1000000 VVT.bit;fpga loadb 0 0x1000000 ${filesize};tftp 0x02080000 uImage;tftp 0x02000000 devicetree.dtb;bootm 0x02080000 - 0x02000000==TFTP IMAGE TFMMC ROOTFS="; /* Default send data */ 
 	int speed ;
+	int ret;
 
 	sleep(1);
+	printf("open zptty\n");
 	fd = OpenDev("/dev/zptty0");
 
 	if (fd > 0) {
@@ -244,35 +246,47 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	//pid = fork();	
-//
-	//if (pid < 0) { 
-	//	fprintf(stderr, "Error in fork!\n"); 
-	//} else if (pid == 0){
-	//	printf("forked\n"); 
-	//	while(1) {
-	//		 printf("1\n"); 
-	//		//printf("%s SEND: %s\n",device, xmit);
-	//		//write(fd, xmit, strlen(xmit));
-	//		sleep(1);
-	//		i++;
-	//	}
-	//	exit(0);
-	//} else { 
-	//	printf("forked2\n"); 
-	//	while(1) {
-	//		nread = read(fd, buff, sizeof(buff));
-	//		if (nread > 0) {
-	//			buff[nread] = '\0';
-	//			printf("%s RECV %d total\n", device, nread);
-	//			printf("%s RECV: %s\n", device, buff);
-	//		}
-	//	}	
-	//}
+
+	//printf("SEND: %s\n", xmit);
+
+	//ret = write(fd, xmit, 250);
+	//printf("ret=%d\n",ret);
+#if 1
+	pid = fork();
+
+	if (pid < 0) { 
+		fprintf(stderr, "Error in fork!\n"); 
+	} else if (pid == 0){
+		printf("forked\n"); 
+		while(1) {
+			 printf("1\n"); 
+			printf("%s SEND: %s\n",device, xmit);
+			//write(fd, xmit, strlen(xmit));
+			sleep(3);
+			i++;
+		}
+		exit(0);
+	} else { 
+		printf("forked2\n"); 
+		while(1) {
+
+			sleep(1);
+			nread = read(fd, buff, sizeof(buff));
+			if (nread > 0) {
+				//buff[nread] = '\0';
+				printf("%s RECV %d total\n", device, nread);
+				hexdump(buff,nread);
+				memset(buff,0,nread);
+			}
+		}
+	}
+#else
 
 	while(1) {
+
 		sleep(1);
 		nread = read(fd, buff, sizeof(buff));
+		printf("nread=%d\n",nread);
 		if (nread > 0) {
 			//buff[nread] = '\0';
 			printf("%s RECV %d total\n", device, nread);
@@ -281,7 +295,9 @@ int main(int argc, char *argv[])
 
 		}
 	}
+#endif
 	close(fd);
+
 	exit(0);
 }
 
