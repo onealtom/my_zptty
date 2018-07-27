@@ -5,7 +5,8 @@ KERNEL_SRC_DIR  ?= /home/tyf/adi2/linux
 
 CROSS_COMPILE  ?= arm-linux-gnueabihf-
 
-obj-m := zptty.o
+vptty-y := zptty.o globalmem.o
+obj-m := vptty.o 
 
 all:
 	make -C $(KERNEL_SRC_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) M=$(PWD) modules

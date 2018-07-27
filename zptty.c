@@ -58,9 +58,43 @@
 #include <asm/page.h>
 #include <asm/byteorder.h>
 
-#define PKT_PAYLOAD_LEN 194
-#define SEND_BUF_MAX		1024
-#define FIFO_BUFFER_SIZE_UL	8192
+#include "globalmem.h"
+
+#if     (LINUX_VERSION_CODE >= 0x030B00)
+#define USE_DEV_GROUPS      1
+#else
+#define USE_DEV_GROUPS      0
+#endif
+
+/*
+typedef struct opt_addr {
+	union {
+		struct{u8 port, node; } bs;
+		u16 ws;
+	} S_un;
+} OPT_ADDR_T;
+*/
+typedef union {
+	struct{uint8_t node, port; } bs;
+	uint16_t ws;
+} OPT_ADDR_T;
+
+#pragma pack(1)
+typedef struct txstart_format_t {
+	uint32_t fsize;
+	uint32_t rsize;
+	char fname[32];
+	uint8_t md5[16];
+} TXSTART_FORMAT_T;
+#pragma pack()
+typedef TXSTART_FORMAT_T * pTXSTART_FORMAT_T;
+
+#define PKT_PAYLOAD_LEN 195
+#define SEND_BUF_MAX		PKT_PAYLOAD_LEN
+#define KFIFO_BUFFER_SIZE_TX	512
+#define TX_START_DATA_LEN       sizeof(TXSTART_FORMAT_T)
+
+
 /********************************************************************************
  * Receive Control Status Registers
  *-------------------------------------------------------------------------------
@@ -124,10 +158,12 @@
  * struct zptty_device_data - Device driver structure
  */
 struct zptty_device_data {
+	struct class class;
 	struct device*       platform_device;
 	struct device*       tty_device;
 	int                  minor_number;
 	struct tty_port      tty_port;
+	struct cdev          cdev;
 	struct mutex         sem;
 	struct resource*     regs_res;
 	struct resource*     irq_res;
@@ -137,12 +173,15 @@ struct zptty_device_data {
 	spinlock_t           irq_lock;
 	struct work_struct   rx_irq_work;
 	struct work_struct   tx_irq_work;
+	struct work_struct   txstart_work;
+	u8 *klayer_frame;
 	wait_queue_head_t    tx_wait_queue;
 	unsigned int         rx_buf_size;
 	unsigned int         tx_buf_size;
 	unsigned int         debug;
 	unsigned int         rx_count;
-
+	OPT_ADDR_T self_addr;
+	pTXSTART_FORMAT_T    txstart_data;
 	struct kfifo fifo_tx;
 	uint8_t* send_buf;
 };
@@ -166,7 +205,7 @@ static struct device*      zptty_device_table[DEVICE_NUMS];
 #define ZPTTY_TX_STAT_ADDR      (0x001E)
 #define ZPTTY_TX_CTRL_ADDR      (0x001F)
 
-
+/*接收中断使能*/
 inline  void zptty_rx_interrupt_enable(struct zptty_device_data* this)
 {
 	u32 tmp;
@@ -175,6 +214,7 @@ inline  void zptty_rx_interrupt_enable(struct zptty_device_data* this)
 	printk("tmpen=%x\n",tmp | RX_INT);
 	iowrite32( tmp | RX_INT , this->regs_addr + VPKT_INTCTL_REG);
 }
+/*可发送中断使能*/
 inline void zptty_tx_buf_empty_interrupt_enable(struct zptty_device_data* this)
 {
 	u32 tmp;
@@ -182,22 +222,28 @@ inline void zptty_tx_buf_empty_interrupt_enable(struct zptty_device_data* this)
 	tmp = ioread32( this->regs_addr + VPKT_INTCTL_REG);
 	//iowrite32( tmp | TX_INT , this->regs_addr + VPKT_INTCTL_REG);
 }
-
+/*获取所有中断状态*/
 inline u32 zptty_get_interrupt_status(struct zptty_device_data* this)
 {
 	dev_info(this->tty_device, "%s\n", __func__);
 	return (u32)ioread32(this->regs_addr + VPKT_INTSTA_REG);
 }
 
-
+/*获取rd_ready状态*/
 inline u32 zptty_rx_get_rd_ready(struct zptty_device_data* this)
 {
 	dev_info(this->tty_device, "%s\n", __func__);
 	return (u32)( ioread32(this->regs_addr + VPKT_RX_STA_REG) );
 }
+/*获取wr_idel状态*/
 inline u32 zptty_tx_get_wr_idel(struct zptty_device_data* this)
 {
 	dev_info(this->tty_device, "%s\n", __func__);
+	return (u32)( ioread32(this->regs_addr + VPKT_TX_STA_REG) );
+}
+/*获取本机自己当前的光纤地址*/
+inline u32 zptty_get_self_addr(struct zptty_device_data* this)
+{
 	return (u32)( ioread32(this->regs_addr + VPKT_TX_STA_REG) );
 }
 /*
@@ -217,6 +263,19 @@ inline u32 zptty_link_get_status(struct zptty_device_data* this)
 	return (u32)( LU_INT & ioread32(this->regs_addr + VPKT_INTSTA_REG) );
 }
 */
+/*读数据寄存器*/
+inline u8 zptty_get_rxdata(struct zptty_device_data* this)
+{
+	return (u8)( ioread32(this->regs_addr + VPKT_RX_DAT_REG) );
+}
+
+inline void zptty_clear_rx_flag(struct zptty_device_data* this)
+{
+	u32 tmp;
+	tmp = (uint8_t)ioread32(this->regs_addr + VPKT_RX_CLR_REG);
+}
+
+/*清除中断控制寄存器中的RX中断*/
 inline void zptty_rx_clear_status_and_interrupt_disable(struct zptty_device_data* this)
 {
 	u32 tmp;
@@ -226,6 +285,7 @@ inline void zptty_rx_clear_status_and_interrupt_disable(struct zptty_device_data
 	printk("tmp=%x\n",tmp);
 	iowrite32( 0x00000000 , this->regs_addr + VPKT_INTCTL_REG);
 }
+/*清除中断控制寄存器中的TX中断*/
 inline void zptty_tx_clear_status_and_interrupt_disable(struct zptty_device_data* this)
 {
 	u32 tmp;
@@ -234,20 +294,23 @@ inline void zptty_tx_clear_status_and_interrupt_disable(struct zptty_device_data
 	iowrite32( tmp & (~TX_INT) , this->regs_addr + VPKT_INTCTL_REG);
 }
 
-
+/*TX发包过程中的写地址寄存器操作*/
 inline void zptty_tx_set_macaddr(struct zptty_device_data* this, uint16_t des_ad, uint16_t src_ad)
 {
 	iowrite16((uint16_t)des_ad, this->regs_addr + VPKT_TX_DES_REG);
 	iowrite16((uint16_t)src_ad, this->regs_addr + VPKT_TX_SRC_REG);
 }
+/*TX发包过程中的写长度寄存器操作*/
 inline void zptty_tx_set_pid(struct zptty_device_data* this, uint8_t pid )
 {
 	iowrite8((uint8_t)pid, this->regs_addr + VPKT_TX_PID_REG);
 }
+/*TX发包过程中的写数据寄存器操作*/
 inline void zptty_tx_set_data(struct zptty_device_data* this, uint8_t data )
 {
 	iowrite8((uint8_t)data, this->regs_addr + VPKT_TX_DAT_REG);
 }
+/*TX发包过程中的启动传输操作*/
 inline void zptty_tx_transmit_start(struct zptty_device_data* this )
 {
 	iowrite8( 0x00, this->regs_addr + VPKT_TX_RUN_REG);
@@ -262,8 +325,8 @@ dev_info(this->tty_device, "%s\n", __func__);
 	i = 0;
 	while ( 0 == ( zptty_tx_get_wr_idel(this) ) ){
 
-		udelay(50);
-		if ( ++i > 10 ){
+		udelay(1);
+		if ( ++i > 500 ){
 			dev_dbg(this->tty_device, "time out!");
 			return -1;
 		}
@@ -275,7 +338,6 @@ dev_info(this->tty_device, "%s\n", __func__);
 	zptty_tx_set_data(this , len);
 
 	for (i = 0; i < len ; i++ ){
-
 		zptty_tx_set_data(this , (uint8_t)*(data+i));
 	}
 
@@ -342,6 +404,7 @@ inline void zptty_rx_remove_from_buf(struct zptty_device_data* this, int size)
 	(buf_count)  = (unsigned int)((regs_val      ) & 0xFFFF);                        \
 	(buf_offset) = (unsigned int)((regs_val >> 16) & 0xFFFF);                        \
 }
+
 /********************************************************************************
  * zptty tty dev_dbg_buf
  ********************************************************************************/
@@ -382,6 +445,36 @@ static void dev_dbg_buf(struct device* dev, const char* func, unsigned char* buf
 	}
 }
 
+static ssize_t rfs_file_info(struct class *cls, struct class_attribute *attr, char *buf)
+{
+	struct zptty_device_data *pdata = (struct watchdog_data *)container_of(cls,  struct zptty_device_data, class);
+
+	return sprintf(buf, "%d/%d\n", pdata->txstart_data->rsize, pdata->txstart_data->fsize);
+
+}
+static ssize_t rfs_file_name(struct class *cls, struct class_attribute *attr, char *buf)
+{
+	struct zptty_device_data *pdata = (struct watchdog_data *)container_of(cls,  struct zptty_device_data, class);
+	return sprintf(buf, "%s", pdata->txstart_data->fname);
+}
+static ssize_t rfs_file_md5(struct class *cls, struct class_attribute *attr, char *buf)
+{
+	int i;
+	struct zptty_device_data *pdata = (struct watchdog_data *)container_of(cls,  struct zptty_device_data, class);
+	for(i=0;i<16;i++){
+		sprintf(buf+i, "%x", pdata->txstart_data->md5[i]);
+	}
+}
+
+/* Attributes declaration: Here I have declared only one attribute attr1 */
+static struct class_attribute zptty_class_attrs[] = {
+	__ATTR(file_size, S_IRUGO | S_IWUSR , rfs_file_info/*r*/, NULL/*w*/), //use macro for permission
+	__ATTR(file_name, S_IRUGO | S_IWUSR , rfs_file_name/*r*/, NULL/*w*/), //use macro for permission
+	__ATTR(file_md5, S_IRUGO | S_IWUSR , rfs_file_md5/*r*/, NULL/*w*/), //use macro for permission
+	__ATTR(file_lock_status, S_IRUGO | S_IWUSR , NULL/*r*/, NULL/*w*/), //use macro for permission
+	__ATTR_NULL
+};
+
 /********************************************************************************
  * zptty tty interrupt service routeins.
  ********************************************************************************/
@@ -415,7 +508,8 @@ static irqreturn_t zptty_irq(int irq, void *data)
 		}
 		if (tx_stat != 0) {
 			zptty_tx_clear_status_and_interrupt_disable(this);
-			schedule_work(&this->tx_irq_work);
+			//schedule_work(&this->tx_irq_work);
+			wake_up_interruptible(&this->tx_wait_queue);
 		}
 	}
 	spin_unlock(&this->irq_lock);
@@ -426,22 +520,44 @@ static irqreturn_t zptty_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+#define PID_TXFILE_ST        254
+#define PID_TXFILE_PAYLOAD   253
+#define PID_TXFILE_END       252
+#define PID_PROTOCOL_FRAME   251
+#define PID_EMU_TTY          250
 /**
  *
  */
+
+static void zptty_txstart_work(struct work_struct* work)
+{
+	int i;
+	pGLOBALMEM_DEV_T p_gm_t;
+	struct zptty_device_data* this = container_of(work, struct zptty_device_data, txstart_work);
+
+	printk("size=%d\n",this->txstart_data->fsize);
+	printk("name=%s\n",this->txstart_data->fname);
+	//printk("md5: ");
+	//for(i=0;i<16;i++){
+	//	printk("%x",this->txstart_data->md5[i]);
+	//}
+	//printk("\n");
+
+	p_gm_t = globalmem_init(this->txstart_data->fsize);
+
+}
 static void zptty_tty_rx_irq_work(struct work_struct* work)
 {
 	struct zptty_device_data* this = container_of(work, struct zptty_device_data, rx_irq_work);
 	struct tty_port*          port;
 	struct tty_struct*        tty;
 	int i;
-	uint8_t des_ad[2];
-	uint8_t src_ad[2];
+	OPT_ADDR_T des, src;
 	uint8_t pid;
 	uint8_t len;
-	uint8_t rx_buf[PKT_PAYLOAD_LEN];
-	uint8_t check[4];
+	uint8_t payload[PKT_PAYLOAD_LEN];
 	uint8_t tmp;
+
 dev_info(this->tty_device, "%s\n", __func__);
 	if (this == NULL)
 		goto done;
@@ -462,43 +578,54 @@ dev_info(this->tty_device, "%s\n", __func__);
 		while(1) {
 			unsigned int   received_size;
 			unsigned int   buf_offset;
-			
+/*rx io work*/
+/* 1. check ready to read */
 			unsigned int rx_stat = zptty_rx_get_rd_ready(this);
 			if (rx_stat == 0) {
 				printk("break\n");
 				break;
 			}
-			des_ad[0] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_REG);
-			des_ad[1] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_REG);
-			src_ad[0] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_REG);
-			src_ad[1] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_REG);
-			//printk("%x %x %x %x \n", des_ad[0], des_ad[1], src_ad[0], src_ad[1] );
+/* 2. read 4byte addr */
+			des.bs.port = zptty_get_rxdata(this);
+			des.bs.node = zptty_get_rxdata(this);
+			src.bs.port = zptty_get_rxdata(this);
+			src.bs.node = zptty_get_rxdata(this);
+/* 3. read 1byte len field */
+			len = zptty_get_rxdata(this);
+			//printk("%x %x %x %x %x\n", mac.qr.a, mac.qr.b, mac.qr.c, mac.qr.d , len);
+			len = (len<=PKT_PAYLOAD_LEN) ? len : PKT_PAYLOAD_LEN ;
 
-			pid = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_REG);
-			len = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_REG);
-			for(i=0;i<PKT_PAYLOAD_LEN;i++){
-				rx_buf[i] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_REG);
+
+/* 4. read payload */
+			for(i=0; i < len; i++){
+				payload[i] = zptty_get_rxdata(this);
 			}
+/* 5. clear page+1 */
+			zptty_clear_rx_flag(this);
+/*rx io work end*/
+			print_hex_dump(KERN_INFO, "RX Frame: ", DUMP_PREFIX_ADDRESS, 16, 1, payload, len, true);
+			//DUMP_PREFIX_ADDRESS,
+#if 1
+			pid = src.bs.port;
+			printk("src.bs.port=%x\n",src.bs.port);
+			if ( PID_EMU_TTY == pid ){
+				tty_insert_flip_string(tty_p, payload, len);
+				tty_flip_buffer_push(tty_p);
+				this->rx_count += len;
+			}else if( PID_TXFILE_ST == pid ){
+				printk("get PID_TXFILE_ST mode\n");
+				memcpy(this->txstart_data, payload, len);
 
-			//check[0] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
-			//check[1] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
-			//check[2] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
-			//check[3] = (uint8_t)ioread8(this->regs_addr + VPKT_RX_DAT_ADDR);
-			//printk("%x %x %x %x \n", check[0],check[1],check[2],check[3] );
-			
-			/*clear page+1 */
-			tmp = (uint8_t)ioread32(this->regs_addr + VPKT_RX_CLR_REG);
+				//
 
-			dev_dbg(tty->dev, "%s rec_len=%d\n", __func__, len);
+			}else if( PID_TXFILE_PAYLOAD == pid ){
 
-		 dev_dbg_buf(tty->dev, __func__, (unsigned char*)(this->regs_addr+buf_offset), len);
+				//p_gm_t
 
-			tty_insert_flip_string(tty_p, rx_buf, len);
-			//tty_insert_flip_char(tty_p, rx_buf, 195);
+			}else if( PID_TXFILE_END == pid ){
 
-			tty_flip_buffer_push(tty_p);
-
-			this->rx_count += len;
+			}
+#endif
 		}
 	}
 
@@ -506,8 +633,10 @@ dev_info(this->tty_device, "%s\n", __func__);
 
 	dev_info(tty->dev, "%s done(%d)\n", __func__, this->rx_count);
 
- done:
+done:
 	return;
+
+
 }
 
 /**
@@ -518,7 +647,10 @@ static void zptty_tty_tx_irq_work(struct work_struct* work)
 	struct zptty_device_data* this = container_of(work, struct zptty_device_data, tx_irq_work);
 	struct tty_port*          port;
 	struct tty_struct*        tty;
-
+	u32 count,tx_cnt;
+	u8* p_buf;
+	u32 frame_nums,remain;
+	int i;
 	if (this == NULL)
 		goto done;
 
@@ -528,9 +660,28 @@ static void zptty_tty_tx_irq_work(struct work_struct* work)
 	if (tty == NULL)
 		goto done;
 
+	count = kfifo_out(&this->fifo_tx, this->send_buf, KFIFO_BUFFER_SIZE_TX);
+	p_buf = this->send_buf;
+
+	if(count > PKT_PAYLOAD_LEN){
+
+		frame_nums = count/PKT_PAYLOAD_LEN;
+		remain = count%PKT_PAYLOAD_LEN;
+
+		for( i=0; i<frame_nums; i++ ){
+			tx_cnt += tx_pkt_frame(this, p_buf , PKT_PAYLOAD_LEN);
+			p_buf+=PKT_PAYLOAD_LEN;
+		}
+		tx_cnt += tx_pkt_frame(this, p_buf , remain);
+
+	}else if(  (count <= PKT_PAYLOAD_LEN) && (count > 0) ){
+		tx_cnt = tx_pkt_frame(this, p_buf, count);
+	}
+	//printk("tx_cnt=%d\n",tx_cnt);
+
 	dev_dbg(tty->dev, "%s\n", __func__);
 
-	wake_up_interruptible(&this->tx_wait_queue);
+	
 
 done:
 	return;
@@ -601,7 +752,7 @@ static void zptty_port_shutdown(struct tty_port* port)
 
 	cancel_work_sync(&this->rx_irq_work);
 	cancel_work_sync(&this->tx_irq_work);
-
+	cancel_work_sync(&this->txstart_work);
 	free_irq(this->irq, this);
 
 	spin_lock_irqsave(&this->irq_lock, irq_flags);
@@ -739,15 +890,17 @@ static int zptty_tty_write(struct tty_struct *tty, const unsigned char* buf, int
     
 	transmit_size = (buf_room_size < count) ? buf_room_size : count;
 
-	retval = kfifo_in(&port->fifo_ul, (unsigned char *)buf, transmit_size);
+	retval = kfifo_in(&this->fifo_tx, (unsigned char *)buf, transmit_size);
 
 	retval = transmit_size;
 
 	dev_dbg(tty->dev, "%s => %d\n", __func__, retval);
 
+	schedule_work(&this->tx_irq_work);
+
 	return retval;
 
-#if 1
+#if 0
 	if(count > PKT_PAYLOAD_LEN){
 
 		frame_nums = count/PKT_PAYLOAD_LEN;
@@ -886,7 +1039,6 @@ static int zptty_device_probe(struct platform_device *pdev)
 	const unsigned int        DONE_GET_IRQ_RESOUCE = (1 << 4);
 	int ret;
 
-
 	printk("zptty_device_probe\n");
 	dev_info(&pdev->dev, "ZPTTY Driver probe start\n");
 	/*
@@ -988,14 +1140,20 @@ static int zptty_device_probe(struct platform_device *pdev)
 	}
 
 	this->send_buf = kmalloc(SEND_BUF_MAX, GFP_KERNEL);
+
 	if (!this->send_buf) {
 		dev_err(&pdev->dev, "Could not allocate send buffer?\n");
 		ret = -ENOMEM;
 		goto err_free_sbuf;
 	}
+	this->txstart_data = kmalloc(TX_START_DATA_LEN, GFP_KERNEL);
+	if (!this->txstart_data) {
+		dev_err(&pdev->dev, "Could not allocate send buffer?\n");
+		ret = -ENOMEM;
+		goto err_free_sbuf;
+	}
 
-
-	if (kfifo_alloc(&this->fifo_tx, FIFO_BUFFER_SIZE_UL,
+	if (kfifo_alloc(&this->fifo_tx, KFIFO_BUFFER_SIZE_TX,
 				GFP_KERNEL)) {
 		dev_err(&pdev->dev,
 				"Could not allocate kfifo buffer\n");
@@ -1003,6 +1161,15 @@ static int zptty_device_probe(struct platform_device *pdev)
 		goto err_free_kfifo;
 	}
 	
+	/* Init class */
+	this->class.name = DRIVER_NAME;
+	this->class.owner = THIS_MODULE;
+	this->class.class_attrs = zptty_class_attrs;
+	ret = class_register(&this->class);
+	if(ret) {
+		printk(KERN_ERR "class_register failed!\n");
+		goto class_register_fail;
+	}
 
 	/*
 	 *
@@ -1012,6 +1179,7 @@ static int zptty_device_probe(struct platform_device *pdev)
 	spin_lock_init(&this->irq_lock);
 	INIT_WORK(&this->rx_irq_work, zptty_tty_rx_irq_work);
 	INIT_WORK(&this->tx_irq_work, zptty_tty_tx_irq_work);
+	INIT_WORK(&this->txstart_work, zptty_txstart_work);
 	init_waitqueue_head(&this->tx_wait_queue);
 	//this->tx_buf_size = (unsigned int)le16_to_cpu(ioread16(this->regs_addr + ZPTTY_TX_BUF_SIZE_ADDR));
 	//this->rx_buf_size = (unsigned int)le16_to_cpu(ioread16(this->regs_addr + ZPTTY_RX_BUF_SIZE_ADDR));
@@ -1033,11 +1201,15 @@ static int zptty_device_probe(struct platform_device *pdev)
 
 	return 0;
 
+class_register_fail:
+
 err_free_kfifo:
 
 	kfifo_free(&this->fifo_tx);
 err_free_sbuf:
+	kfree(this->txstart_data);
 	kfree(this->send_buf);
+
 
  failed:
 	if (done & DONE_MAP_REGS_ADDR)   { iounmap(this->regs_addr); }
@@ -1069,6 +1241,7 @@ static int zptty_device_remove(struct platform_device *pdev)
 	kfifo_free(&this->fifo_tx);
 
 	kfree(this->send_buf);
+	kfree(this->txstart_data);
 
 	iounmap(this->regs_addr);
 	release_mem_region(this->regs_res->start, this->regs_res->end - this->regs_res->start + 1);
@@ -1117,6 +1290,8 @@ static int __init zptty_module_init(void)
 	unsigned int       done   = 0;
 	const unsigned int DONE_TTY_DRV_REGISTER = (1 << 0);
 	const unsigned int DONE_PLT_DRV_REGISTER = (1 << 1);
+
+	globalmem_init(2654720);
 printk("zptty_module_init\n");
 	for (i = 0; i < DEVICE_NUMS; i++){
 		zptty_device_table[i] = NULL;
@@ -1171,6 +1346,7 @@ static void __exit zptty_module_exit(void)
 {
 	platform_driver_unregister(&zptty_platform_driver);
 	tty_unregister_driver(zptty_tty_driver);
+	globalmem_exit();
 }
 
 module_init(zptty_module_init);

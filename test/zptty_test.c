@@ -225,10 +225,10 @@ int main(int argc, char *argv[])
 	int nread;			/* Read the counts of data */
 	char buff[512];		/* Recvice data buffer */
 	pid_t pid;
-	char *xmit = "setenv bootargs 'noinitrd console=ttyPS0,115200 ip=192.168.3.223 root=/dev/nfs rw nfsroot=192.168.3.100:/volume1/Incoming/ramdisk_FILES,nolock earlyprintk';set ipaddr 192.168.3.222;setenv serverip 192.168.3.100;tftp 0x1000000 VVT.bit;fpga loadb 0 0x1000000 ${filesize};tftp 0x02080000 uImage;tftp 0x02000000 devicetree.dtb;bootm 0x02080000 - 0x02000000==TFTP IMAGE TFMMC ROOTFS="; /* Default send data */ 
+	char *xmit = "Best Home Furnishings specializes in the manufacturing of upholstered products such as sofas, recliners, chairs, glider rockers, office chairs and tables. With over 1,000 fabric and leather options available on this expansive collection, manufactured in days, not weeks, customers can rely on this Southern Indiana based company for valued products.";
 	int speed ;
 	int ret;
-
+	int ret_w;
 	sleep(1);
 	printf("open zptty\n");
 	fd = OpenDev("/dev/zptty0");
@@ -259,9 +259,10 @@ int main(int argc, char *argv[])
 	} else if (pid == 0){
 		printf("forked\n"); 
 		while(1) {
-			 printf("1\n"); 
-			printf("%s SEND: %s\n",device, xmit);
-			//write(fd, xmit, strlen(xmit));
+			printf("1\n"); 
+			//printf("%s SEND: %s\n",device, xmit);
+			//ret_w = write(fd, xmit, strlen(xmit));
+			printf("ret_w=%d\n",ret_w);
 			sleep(3);
 			i++;
 		}
